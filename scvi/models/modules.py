@@ -34,7 +34,7 @@ class FCLayers(nn.Module):
 
         self.fc_layers = nn.Sequential(collections.OrderedDict(
             [('Layer {}'.format(i), nn.Sequential(
-                nn.Linear(n_in + sum(self.n_cat_list), n_out),
+                nn.Linear(n_in + sum(self.n_ca                                                                          t_list), n_out),
                 nn.BatchNorm1d(n_out, momentum=.01, eps=0.001) if use_batch_norm else None,
                 nn.ReLU(),
                 nn.Dropout(p=dropout_rate) if dropout_rate > 0 else None))
