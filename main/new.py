@@ -2,6 +2,16 @@
 import torch
 import numpy as np
 
+torch.manual_seed(0)
+np.random.seed(0)
+
+
+import pandas as pd
+import scanpy as sc
+
+sc.settings.verbosity = 0
+
+
 import scanpy as sc
 import os , sys
 
@@ -172,3 +182,71 @@ scvi_posterior, scvi_latent = compute_scvi_latent(
     adata_original, n_epochs=n_epochs, n_latent=6
 )
 adata.obsm["X_scvi"] = scvi_latent
+
+
+
+"""
+Finding marker genes
+"""
+
+def rank_genes_groups_bayes(
+    adata: sc.AnnData,
+    scvi_posterior: scvi.inference.Posterior,
+    n_samples: int = None,
+    M_permutation: int = None,
+    n_genes: int = 25,
+    label_name: str = "louvain_scvi",
+) -> pd.DataFrame:
+    """
+    Rank genes for characterizing groups.
+    Computes Bayes factor for each cluster against the others to test for differential expression.
+    See Nature article (https://rdcu.be/bdHYQ)
+
+    :param adata: sc.AnnData object non-normalized
+    :param scvi_posterior:
+    :param n_samples:
+    :param M_permutation:
+    :param n_genes:
+    :param label_name: The groups tested are taken from adata.obs[label_name] which can be computed
+                       using clustering like Louvain (Ex: sc.tl.louvain(adata, key_added=label_name) )
+    :return: Summary of Bayes factor per gene, per cluster
+    """
+
+    # Call scvi function
+    per_cluster_de, cluster_id = scvi_posterior.one_vs_all_degenes(
+        cell_labels=np.asarray(adata.obs[label_name].values).astype(int).ravel(),
+        min_cells=1,
+        n_samples=n_samples,
+        M_permutation=M_permutation,
+    )
+
+    # convert to ScanPy format -- this is just about feeding scvi results into a format readable by ScanPy
+    markers = []
+    scores = []
+    names = []
+    for i, x in enumerate(per_cluster_de):
+        subset_de = x[:n_genes]
+        markers.append(subset_de)
+        scores.append(tuple(subset_de["bayes1"].values))
+        names.append(tuple(subset_de.index.values))
+
+    markers = pd.concat(markers)
+    dtypes_scores = [(str(i), "<f4") for i in range(len(scores))]
+    dtypes_names = [(str(i), "<U50") for i in range(len(names))]
+    scores = np.array([tuple(row) for row in np.array(scores).T], dtype=dtypes_scores)
+    scores = scores.view(np.recarray)
+    names = np.array([tuple(row) for row in np.array(names).T], dtype=dtypes_names)
+    names = names.view(np.recarray)
+
+    adata.uns["rank_genes_groups_scvi"] = {
+        "params": {
+            "groupby": "",
+            "reference": "rest",
+            "method": "",
+            "use_raw": True,
+            "corr_method": "",
+        },
+        "scores": scores,
+        "names": names,
+    }
+    return markers
