@@ -19,7 +19,7 @@ torch.cuda.is_available()
 
 if torch.cuda.is_available():
     device = torch.device("cuda")          # a CUDA device object
-    y = torch.ones_like(x, device=device)  # directly create a tensor on GPU
+    y = torch.ones_like(x, device=device)  # directly cwreate a tensor on GPU
     x = x.to(device)                       # or just use strings ``.to("cuda")``
     z = x + y
     print(z)
