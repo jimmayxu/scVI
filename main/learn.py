@@ -40,13 +40,13 @@ class MyNet(nn.Module):
     def __init__(self):
         super(MyNet, self).__init__()
         # 1 input image channel, 6 output channels, 5x5 square convolution
-        # kernel
+        # kernel (32- (5+1)) = 26
         self.conv1 = nn.Conv2d(1, 6, 5)
         self.conv2 = nn.Conv2d(6, 16, 5)
         # an affine operation: y = Wx + b
         self.fc1 = nn.Linear(16 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
+        self.fc2 = nn.Linear(120, 90)
+        self.fc3 = nn.Linear(90, 10)
 
     def forward(self, x):
         # Max pooling over a (2, 2) window
@@ -66,7 +66,18 @@ class MyNet(nn.Module):
             num_features *= s
         return num_features
 
-device = torch.device("cuda:0")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+net = MyNet()
+
+params = list(net.parameters())
+print(len(params))
+
+print(params[8].size())
+
+input = torch.randn(1, 1, 32, 32)
+out = net(input)
+print(out)
 
 
 params = list(net.parameters())
@@ -102,8 +113,18 @@ for f in net.parameters():
 import torch.optim as optim
 net = MyNet()
 
-net = nn.DataParallel(net)
-net.to(device)
+#net = nn.DataParallel(net)
+#net.to(device)
+
+params = list(net.parameters())
+print(len(params))
+
+print(params[3].size())
+
+input = torch.randn(1, 1, 32, 32)
+out = net(input)
+print(out)
+
 
 # create your optimizer
 optimizer = optim.SGD(net.parameters(), lr=0.01)
