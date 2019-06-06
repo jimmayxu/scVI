@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Normal, Poisson, kl_divergence as kl
 
-from scvi.models import VAE
+from scvi.models.vae import VAE
 from scvi.models.classifier import Classifier
 from scvi.models.log_likelihood import log_zinb_positive, log_nb_positive
 from scvi.models.modules import Encoder, DecoderSCVI

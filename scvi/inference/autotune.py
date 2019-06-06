@@ -28,10 +28,10 @@ import numpy as np
 import torch
 import tqdm
 
-from . import Trainer
-from .inference import UnsupervisedTrainer
-from ..dataset import GeneExpressionDataset
-from ..models import VAE
+from scvi.inference.trainer import Trainer ####
+from scvi.inference.inference import UnsupervisedTrainer####
+from scvi.dataset import GeneExpressionDataset####
+from scvi.models.vae import VAE####
 
 # TODO: add database watcher and visualizations
 # TODO: make worker_launcher a subclass of threading.Thread
