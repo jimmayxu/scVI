@@ -214,9 +214,8 @@ def impute_anno(bdata,select, anno_key,n_neighbor=10):
     return np.array(anno_uniq)[select_anno], anno_ratio[select_anno][:,select]
 
 
-def draw_graph(tfdata, anno_key, anno_uniq, anno_ratio,adjust=False,z_score_cut = 2, 
+def draw_graph(tfdata, anno_uniq, anno_ratio,adjust=False,z_score_cut = 2,
                factor0 = 2, text_fontsize=10):
-    import seaborn as sns
     palette1 =    ["#023fa5", "#7d87b9", "#bec1d4", "#d6bcc0", "#bb7784", "#8e063b", "#4a6fe3",
         "#8595e1", "#b5bbe3", "#e6afb9", "#e07b91", "#d33f6a", "#11c638", "#8dd593",
         "#c6dec7", "#ead3c6", "#f0b98d", "#ef9708", "#0fcfc0", "#9cded6", "#d5eae7",
@@ -244,7 +243,7 @@ def draw_graph(tfdata, anno_key, anno_uniq, anno_ratio,adjust=False,z_score_cut 
     Cr_an = Cr[len(tfdata):,:len(tfdata)]
     color_anno = np.argmax(Cr_an,axis=0)
     
-    C = tfdata.uns['neighbors']['connectivities'].todense()
+    C = tfdata.uns['neighbors']['connectivities'].todense() # zx3 bdata.uns['neighbors']['connectivities']
     #C = Cr[:len(tfdata),:len(tfdata)]
     pairs = np.where(C>0.3)
 
@@ -263,7 +262,7 @@ def draw_graph(tfdata, anno_key, anno_uniq, anno_ratio,adjust=False,z_score_cut 
     dot_size = dot_size0**(gamma)
 
 
-    axis = 'X_draw_graph_fa'
+    axis = 'X_draw_graph_fr'
     x = tfdata.obsm[axis][:,0]
     y = tfdata.obsm[axis][:,1]
     n = list(tfdata.obs_names)

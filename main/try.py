@@ -93,6 +93,11 @@ plt.show()
 full = trainer.create_posterior(trainer.model, gene_dataset, indices=np.arange(len(gene_dataset)))
 print("Entropy batch mixing :", full.entropy_batch_mixing())
 
+full.clustering_scores(prediction_algorithm = "gmm")
+full.show_t_sne()
+xx = full.one_vs_all_degenes()
+
+
 # ========
 
 from scvi.inference import Trainer
@@ -243,6 +248,8 @@ from scvi.inference.posterior import Posterior
 
 ll_train = trainer.history["ll_train_set"]
 ll_test = trainer.history["ll_test_set"]
+
+
 
 
 
