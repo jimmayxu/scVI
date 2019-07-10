@@ -36,6 +36,15 @@ def test_cortex(save_path):
     trainer_cortex_vae.train(n_epochs=1)
     trainer_cortex_vae.uncorrupt_posteriors()
 
+    full = trainer_cortex_vae.create_posterior(
+        vae,
+        cortex_dataset,
+        indices=np.arange(len(cortex_dataset))
+    )
+    x_new, x_old = full.generate(n_samples=10)
+    assert x_new.shape == (len(cortex_dataset), cortex_dataset.nb_genes, 10)
+    assert x_old.shape == (len(cortex_dataset), cortex_dataset.nb_genes)
+
     trainer_cortex_vae.train_set.imputation_benchmark(n_samples=1, show_plot=False,
                                                       title_plot='imputation', save_path=save_path)
 
@@ -73,7 +82,7 @@ def test_synthetic_1():
     trainer_synthetic_svaec = JointSemiSupervisedTrainer(svaec, synthetic_dataset, use_cuda=use_cuda)
     trainer_synthetic_svaec.train(n_epochs=1)
     trainer_synthetic_svaec.labelled_set.entropy_batch_mixing()
-    trainer_synthetic_svaec.full_dataset.knn_purity(verbose=True)
+    trainer_synthetic_svaec.full_dataset.knn_purity()
     trainer_synthetic_svaec.labelled_set.show_t_sne(n_samples=5)
     trainer_synthetic_svaec.unlabelled_set.show_t_sne(n_samples=5, color_by='labels')
     trainer_synthetic_svaec.labelled_set.show_t_sne(n_samples=5, color_by='batches and labels')
