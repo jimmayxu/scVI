@@ -22,6 +22,8 @@ from sklearn.neighbors import NearestNeighbors, KNeighborsRegressor
 from sklearn.utils.linear_assignment_ import linear_assignment
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SequentialSampler, SubsetRandomSampler, RandomSampler
+from scipy.special import betainc
+from torch.distributions import Normal, kl_divergence as kl
 
 from scvi.dataset import GeneExpressionDataset
 from scvi.models.log_likelihood import compute_elbo, compute_reconstruction_error, compute_marginal_log_likelihood
@@ -118,6 +120,13 @@ class Posterior:
         else:
             return np.arange(len(self.gene_dataset))
 
+    @property
+    def nb_cells(self):
+        if hasattr(self.data_loader.sampler, "indices"):
+            return len(self.data_loader.sampler.indices)
+        else:
+            return self.gene_dataset.nb_cells
+
     def __iter__(self):
         return map(self.to_cuda, iter(self.data_loader))
 
@@ -143,6 +152,82 @@ class Posterior:
         return self.update({"collate_fn": self.gene_dataset.collate_fn_builder()})
 
     @torch.no_grad()
+    def get_latents(self, n_samples=1, other=None, device='gpu'):
+        """
+        Computes all quantities of interest for DE in a sequential order
+
+        WARNING: BATCH EFFECTS NOT TAKEN INTO ACCOUNT AS FOR NOW
+        # TODO: TAKE THEM INTO ACCOUNT (NOT THAT HARD)
+
+        :param n_samples:
+        :param other:
+        :return:
+        """
+        zs = []
+        labels = []
+        scales = []
+        n_bio_batches = self.gene_dataset.n_batches
+        with torch.no_grad():
+            for tensors in self.sequential():
+                sample_batch, _, _, batch_index, label = tensors
+                outputs = self.model.inference(sample_batch, batch_index, n_samples=n_samples)
+                z = outputs['z']
+
+                norm_library = 4. * torch.ones_like(sample_batch[:, [0]])
+                scale_batch = []
+                if other is not None:
+                    for bio_batch in range(n_bio_batches):
+                        batch_index = 1.0 * torch.ones_like(sample_batch[:, [0]])
+                        scale_batch.append(
+                            self.model.decoder.forward('gene', z, norm_library, batch_index)[0]
+                        )
+                    # each elem of scale_batch has shape (n_samples, n_batch, n_genes)
+                    scale_batch = torch.cat(scale_batch, dim=0)
+
+                if device == 'cpu':
+                    label = label.cpu()
+                    z = z.cpu()
+                    if other is not None:
+                        scale_batch = scale_batch.cpu()
+
+                # print(label.device, z.device, scale_batch.device)
+                labels.append(label)
+                zs.append(z)
+                scales.append(scale_batch)
+
+        if n_samples > 1:
+            # Then each z element has shape (n_samples, n_batch, n_latent)
+            # Hence we concatenate on dimension 1
+            zs = torch.cat(zs, dim=1)
+            if other is not None:
+                scales = torch.cat(scales, dim=1)
+
+            # zs = zs.transpose(0, 1)
+            # zs = zs.transpose(1, 2)
+            # New shape (n_batch, b)
+        else:
+            zs = torch.cat(zs)
+        labels = torch.cat(labels)
+        if other is not None:
+            return zs, labels, scales
+        return zs, labels
+
+    @torch.no_grad()
+    def get_data(self):
+        """
+
+        :return:
+        """
+        xs, labels = [], []
+        for tensors in self.sequential():
+            sample_batch, _, _, batch_index, label = tensors
+            xs.append(sample_batch.cpu())
+            labels.append(label.cpu())
+        xs = torch.cat(xs)
+        labels = torch.cat(labels)
+        return xs, labels
+
+    @torch.no_grad()
     def elbo(self):
         elbo = compute_elbo(self.model, self)
         logger.debug("ELBO : %.4f" % elbo)
@@ -159,8 +244,8 @@ class Posterior:
     reconstruction_error.mode = "min"
 
     @torch.no_grad()
-    def marginal_ll(self, n_mc_samples=1000):
-        ll = compute_marginal_log_likelihood(self.model, self, n_mc_samples)
+    def marginal_ll(self, n_mc_samples=1000, ratio_loss=False):
+        ll = compute_marginal_log_likelihood(self.model, self, n_mc_samples, ratio_loss=ratio_loss)
         logger.debug("True LL : %.4f" % ll)
         return ll
 
@@ -231,6 +316,7 @@ class Posterior:
 
     @torch.no_grad()
     def sample_scale_from_batch(self, n_samples, batchid=None, selection=None):
+        #TODO: Implement log probas
         px_scales = []
         if selection is None:
             raise ValueError("selections should be a list of cell subsets indices")
@@ -246,7 +332,134 @@ class Posterior:
             px_scales.append(self.get_harmonized_scale(i))
         self.data_loader = old_loader
         px_scales = np.concatenate(px_scales)
-        return px_scales
+        return px_scales, None
+
+    @torch.no_grad()
+    def sample_poisson_from_batch(self, n_samples, batchid=None, selection=None):
+        # TODO: Refactor?
+        px_scales = []
+        log_probas = []
+        if selection is None:
+            raise ValueError("selections should be a list of cell subsets indices")
+        else:
+            if selection.dtype is np.dtype('bool'):
+                selection = np.asarray(np.where(selection)[0].ravel())
+        old_loader = self.data_loader
+        for i in batchid:
+            idx = np.random.choice(np.arange(len(self.gene_dataset))[selection], n_samples)
+            sampler = SubsetRandomSampler(idx)
+            self.data_loader_kwargs.update({'sampler': sampler})
+            self.data_loader = DataLoader(self.gene_dataset, **self.data_loader_kwargs)
+
+            for tensors in self:
+                sample_batch, local_l_mean, local_l_var, batch_index, label = tensors
+                px_scale, px_dispersion, px_rate, px_dropout, qz_m, qz_v, z, ql_m, ql_v, library = \
+                    self.model.inference(sample_batch, batch_index, label)
+
+                # px_rate = self.get_harmonized_scale(i)
+                # p = px_rate / (px_rate + px_dispersion.cpu().numpy())
+                # r = px_dispersion.cpu().numpy()
+
+                # p = (px_scale / (px_scale + px_dispersion)).cpu().numpy()
+                p = (px_rate / (px_rate + px_dispersion)).cpu().numpy()
+                r = px_dispersion.cpu().numpy()
+
+                l_train = np.random.gamma(r, p / (1 - p))
+                px_scales.append(l_train)
+
+                log_px_z = self.model._reconstruction_loss(sample_batch, px_rate, px_dispersion,
+                                                           px_dropout)
+                log_pz = Normal(torch.zeros_like(qz_m), torch.ones_like(qz_v)).log_prob(z).sum(
+                    dim=-1)
+                log_qz_x = Normal(qz_m, qz_v.sqrt()).log_prob(z).sum(dim=-1)
+                log_p = log_pz + log_px_z - log_qz_x
+                log_probas.append(log_p.cpu().numpy())
+
+        self.data_loader = old_loader
+        px_scales = np.concatenate(px_scales)
+        log_probas = np.concatenate(log_probas)
+        return px_scales, log_probas
+
+    @torch.no_grad()
+    def sample_gamma_params_from_batch(self, n_samples, batchid=None, selection=None):
+        shapes_res, scales_res = [], []
+        dispersions = []
+        if selection is None:
+            raise ValueError("selections should be a list of cell subsets indices")
+        else:
+            if selection.dtype is np.dtype('bool'):
+                selection = np.asarray(np.where(selection)[0].ravel())
+        old_loader = self.data_loader
+        for i in batchid:
+            idx = np.random.choice(np.arange(len(self.gene_dataset))[selection], n_samples)
+            sampler = SubsetRandomSampler(idx)
+            self.data_loader_kwargs.update({'sampler': sampler})
+            self.data_loader = DataLoader(self.gene_dataset, **self.data_loader_kwargs)
+        #
+        #     # fixed_batch = float(i)
+            for tensors in self:
+                sample_batch, local_l_mean, local_l_var, batch_index, label = tensors
+                px_scale, px_dispersion, px_rate = self.model.inference(sample_batch, batch_index, label)[0:3]
+
+                # px_rate = self.get_harmonized_scale(i)
+                # p = px_rate / (px_rate + px_dispersion.cpu().numpy())
+                # r = px_dispersion.cpu().numpy()
+
+                # p = (px_scale / (px_scale + px_dispersion)).cpu().numpy()
+                p = (px_rate / (px_rate + px_dispersion)).cpu().numpy()
+                r = px_dispersion.cpu().numpy()
+
+                shapes_batch = r
+                scales_batch = p / (1.0 - p)
+
+                if len(shapes_batch.shape) == 1:
+                    shapes_batch = np.repeat(shapes_batch.reshape((1, -1)),
+                                             repeats=scales_batch.shape[0], axis=0)
+
+                shapes_res.append(shapes_batch)
+                scales_res.append(scales_batch)
+        self.data_loader = old_loader
+        shapes_res = np.concatenate(shapes_res)
+        scales_res = np.concatenate(scales_res)
+
+        assert shapes_res.shape == scales_res.shape, (shapes_res.shape, scales_res.shape)
+        return shapes_res, scales_res
+
+    @torch.no_grad()
+    def differential_expression_gamma(self, idx1, idx2, batchid1=None, batchid2=None,
+                                      genes=None, n_samples=None, M_permutation=None, all_stats=True,
+                                      sample_pairs=True):
+        n_samples = 5000 if n_samples is None else n_samples
+        M_permutation = 10000 if M_permutation is None else M_permutation
+        if batchid1 is None:
+            batchid1 = np.arange(self.gene_dataset.n_batches)
+        if batchid2 is None:
+            batchid2 = np.arange(self.gene_dataset.n_batches)
+
+        shapes1, scales1 = self.sample_gamma_params_from_batch(selection=idx1, batchid=batchid1,
+                                                               n_samples=n_samples)
+        shapes2, scales2 = self.sample_gamma_params_from_batch(selection=idx2, batchid=batchid2,
+                                                               n_samples=n_samples)
+        print(shapes1.shape, scales1.shape, shapes2.shape, scales2.shape)
+        all_labels = np.concatenate((np.repeat(0, len(shapes1)), np.repeat(1, len(shapes2))),
+                                    axis=0)
+
+        if genes is not None:
+            shapes1 = shapes1[:, self.gene_dataset._gene_idx(genes)]
+            scales1 = scales1[:, self.gene_dataset._gene_idx(genes)]
+            shapes2 = shapes2[:, self.gene_dataset._gene_idx(genes)]
+            scales2 = scales2[:, self.gene_dataset._gene_idx(genes)]
+
+        shapes = np.concatenate((shapes1, shapes2), axis=0)
+        scales = np.concatenate((scales1, scales2), axis=0)
+
+        assert shapes.shape == scales.shape, (shapes.shape, scales.shape)
+        data = (shapes, scales)
+
+        bayes1 = get_bayes_gamma(data, all_labels, cell_idx=0, M_permutation=M_permutation,
+                                 permutation=False, sample_pairs=sample_pairs)
+        bayes1 = pd.Series(data=bayes1, index=self.gene_dataset.gene_names)
+        return bayes1
 
     @torch.no_grad()
     def differential_expression_score(
@@ -260,6 +473,8 @@ class Posterior:
         sample_pairs: bool = True,
         M_permutation: int = None,
         all_stats: bool = True,
+        sample_gamma: bool = False,
+        importance_sampling: bool = False
     ):
         """Computes gene specific Bayes factors using masks idx1 and idx2
 
@@ -303,28 +518,52 @@ class Posterior:
             batchid1 = np.arange(self.gene_dataset.n_batches)
         if batchid2 is None:
             batchid2 = np.arange(self.gene_dataset.n_batches)
-        px_scale1 = self.sample_scale_from_batch(selection=idx1, batchid=batchid1,
-                                                 n_samples=n_samples)
-        px_scale2 = self.sample_scale_from_batch(selection=idx2, batchid=batchid2,
-                                                 n_samples=n_samples)
+
+        if sample_gamma:
+            px_scale1, log_probas1 = self.sample_poisson_from_batch(selection=idx1,
+                                                                    batchid=batchid1,
+                                                                    n_samples=n_samples)
+            px_scale2, log_probas2 = self.sample_poisson_from_batch(selection=idx2,
+                                                                    batchid=batchid2,
+                                                                    n_samples=n_samples)
+        else:
+            px_scale1, log_probas1 = self.sample_scale_from_batch(selection=idx1, batchid=batchid1,
+                                                                  n_samples=n_samples)
+            px_scale2, log_probas2 = self.sample_scale_from_batch(selection=idx2, batchid=batchid2,
+                                                                  n_samples=n_samples)
         px_scale_mean1 = px_scale1.mean(axis=0)
         px_scale_mean2 = px_scale2.mean(axis=0)
         px_scale = np.concatenate((px_scale1, px_scale2), axis=0)
-        all_labels = np.concatenate((np.repeat(0, len(px_scale1)), np.repeat(1, len(px_scale2))), axis=0)
+        if log_probas1 is not None:
+            log_probas = np.concatenate((log_probas1, log_probas2), axis=0)
+        else:
+            log_probas = None
+        # print('px_scales1 shapes', px_scale1.shape)
+        # print('px_scales2 shapes', px_scale2.shape)
+        all_labels = np.concatenate((np.repeat(0, len(px_scale1)), np.repeat(1, len(px_scale2))),
+                                    axis=0)
         if genes is not None:
             px_scale = px_scale[:, self.gene_dataset.genes_to_index(genes)]
         bayes1 = get_bayes_factors(px_scale, all_labels, cell_idx=0, M_permutation=M_permutation,
-                                   permutation=False, sample_pairs=sample_pairs)
+                                   permutation=False, sample_pairs=sample_pairs,
+                                   importance_sampling=importance_sampling,
+                                   log_ratios=log_probas)
         if all_stats is True:
             bayes1_permuted = get_bayes_factors(px_scale, all_labels, cell_idx=0,
                                                 M_permutation=M_permutation,
-                                                permutation=True, sample_pairs=sample_pairs)
+                                                permutation=True, sample_pairs=sample_pairs,
+                                                importance_sampling=importance_sampling,
+                                                log_ratios=log_probas)
             bayes2 = get_bayes_factors(px_scale, all_labels, cell_idx=1,
                                        M_permutation=M_permutation,
-                                       permutation=False, sample_pairs=sample_pairs)
+                                       permutation=False, sample_pairs=sample_pairs,
+                                       importance_sampling=importance_sampling,
+                                       log_ratios=log_probas)
             bayes2_permuted = get_bayes_factors(px_scale, all_labels, cell_idx=1,
                                                 M_permutation=M_permutation,
-                                                permutation=True, sample_pairs=sample_pairs)
+                                                permutation=True, sample_pairs=sample_pairs,
+                                                importance_sampling=importance_sampling,
+                                                log_ratios=log_probas)
             mean1, mean2, nonz1, nonz2, norm_mean1, norm_mean2 = \
                 self.gene_dataset.raw_counts_properties(idx1, idx2)
             res = pd.DataFrame([bayes1, bayes1_permuted, bayes2, bayes2_permuted,
@@ -337,7 +576,7 @@ class Posterior:
             res = res.sort_values(by=["bayes1"], ascending=False)
             return res
         else:
-            return bayes1
+            return pd.Series(data=bayes1, index=self.gene_dataset.gene_names)
 
     @torch.no_grad()
     def one_vs_all_degenes(
@@ -385,7 +624,8 @@ class Posterior:
             if len(cell_labels) != len(self.gene_dataset):
                 raise ValueError(" the length of cell_labels have to be "
                                  "the same as the number of cells")
-        if (cell_labels is None) and not hasattr(self.gene_dataset, "cell_types"):
+
+        if (cell_labels is None) and not hasattr(self.gene_dataset, 'cell_types'):
             raise ValueError("If gene_dataset is not annotated with labels and cell types,"
                              " then must provide cell_labels")
         # Input cell_labels take precedence over cell type label annotation in dataset
@@ -395,6 +635,7 @@ class Posterior:
         else:
             cluster_id = self.gene_dataset.cell_types
             cell_labels = self.gene_dataset.labels.ravel()
+
         de_res = []
         de_cluster = []
         for i, x in enumerate(cluster_id):
@@ -406,6 +647,7 @@ class Posterior:
                 idx2 = (cell_labels != i) * subset
             if np.sum(idx1) > min_cells and np.sum(idx2) > min_cells:
                 de_cluster.append(x)
+                # TODO: Understand issue when Sample_pairs=True
                 res = self.differential_expression_score(idx1=idx1, idx2=idx2,
                                                          M_permutation=M_permutation,
                                                          n_samples=n_samples,
@@ -466,10 +708,7 @@ class Posterior:
         """
         if len(self.gene_dataset) != len(states):
             raise ValueError(" the length of states have to be the same as the number of cells")
-        if cell_labels is not None:
-            if len(cell_labels) != len(self.gene_dataset):
-                raise ValueError(" the length of cell_labels have to be "
-                                 "the same as the number of cells")
+
         if (cell_labels is None) and not hasattr(self.gene_dataset, "cell_types"):
             raise ValueError("If gene_dataset is not annotated with labels and cell types,"
                              " then must provide cell_labels")
@@ -484,6 +723,7 @@ class Posterior:
         de_cluster = []
         states = np.asarray([1 if x else 0 for x in states])
         nstates = np.asarray([0 if x else 1 for x in states])
+
         for i, x in enumerate(cluster_id):
             if subset is None:
                 idx1 = (cell_labels == i) * states
@@ -542,12 +782,15 @@ class Posterior:
         x_new = []
         for tensors in self.update({"batch_size": batch_size}):
             sample_batch, _, _, batch_index, labels = tensors
-            px_dispersion, px_rate, px_dropout = self.model.inference(
+            outputs = self.model.inference(
                 sample_batch,
                 batch_index=batch_index,
                 y=labels,
                 n_samples=n_samples
-            )[1:4]
+            )
+            px_dispersion = outputs['px_r']
+            px_rate = outputs['px_rate']
+            px_dropout = outputs['px_dropout']
 
             p = px_rate / (px_rate + px_dispersion)
             r = px_dispersion
@@ -582,8 +825,16 @@ class Posterior:
         dispersion_list = []
         for tensors in self.sequential(1000):
             sample_batch, _, _, batch_index, labels = tensors
-            px_dispersion, px_rate, px_dropout = self.model.inference(sample_batch, batch_index=batch_index, y=labels,
-                                                                      n_samples=1)[1:4]
+
+            outputs = self.model.inference(
+                sample_batch,
+                batch_index=batch_index,
+                y=labels,
+                n_samples=1
+            )
+            px_dispersion = outputs['px_r']
+            px_rate = outputs['px_rate']
+            px_dropout = outputs['px_dropout']
 
             dispersion_list += [np.repeat(np.array(px_dispersion.cpu())[np.newaxis, :], px_rate.size(0), axis=0)]
             mean_list += [np.array(px_rate.cpu())]
@@ -596,8 +847,7 @@ class Posterior:
         libraries = []
         for tensors in self.sequential(batch_size=128):
             x, local_l_mean, local_l_var, batch_index, y = tensors
-            px_scale, px_r, px_rate, px_dropout, qz_m, qz_v, z, ql_m, ql_v, library = \
-                self.model.inference(x, batch_index, y)
+            library = self.model.inference(x, batch_index, y)['library']
             libraries += [np.array(library.cpu())]
         libraries = np.concatenate(libraries)
         return libraries.ravel()
@@ -827,12 +1077,80 @@ def entropy_batch_mixing(latent_space, batches, n_neighbors=50, n_pools=50, n_sa
     return score / float(n_pools)
 
 
+def softmax(x, axis=None):
+    """
+    Compute the softmax of each element along an axis of X.
+    Parameters
+    ----------
+    x: ND-Array. Probably should be floats.
+    theta (optional): float parameter, used as a multiplier
+        prior to exponentiation. Default = 1.0
+    axis (optional): axis to compute values along. Default is the
+        first non-singleton axis.
+    Returns an array the same size as X. The result will sum to 1
+    along the specified axis.
+    """
+    y = np.atleast_2d(x)
+    if axis is None:
+        axis = next(j[0] for j in enumerate(y.shape) if j[1] > 1)
+    y = y - np.expand_dims(np.max(y, axis=axis), axis)
+    y = np.exp(y)
+    ax_sum = np.expand_dims(np.sum(y, axis=axis), axis)
+    p = y / ax_sum
+    if len(x.shape) == 1:
+        p = p.flatten()
+    return p
+
+
+def get_sampling_pair_idx(list_1, list_2, do_sample=True, permutation=False, M_permutation=10000,
+                          probas_a=None, probas_b=None):
+    """
+    Returns the indices of the sampled quantities of populations 1 and 2
+    that will be compared.
+
+    This function has several modes based on the values of do_sample and permutation
+    as described below
+
+
+    :param list_1: Indices corresponding to population 1
+    :param list_2: Indices corresponding to population 2
+    :param do_sample: Are pairs sampled? If not, we compare the posterior quantities
+    TERMISE
+    :param permutation: has only effect when do_sample is True.
+        - if permutation=False, NORMAL BEHAVIOR : elements used for pop 2 come from list_1
+        and vice-versa for 2
+        - if permutation=True, SPECIFIC BEHAVIOR: All elements are sampled.
+        Should only be used as a sanity check.
+
+    :param M_permutation:
+    :param probas_a: used for Importance Sampling, set to None by default
+    :param probas_b: used for Importance Sampling, set to None by default
+    :return:
+    """
+    if do_sample:
+        if not permutation:
+            # case1: no permutation, sample from A and then from B
+            u, v = np.random.choice(list_1, size=M_permutation, p=probas_a), \
+                   np.random.choice(list_2, size=M_permutation, p=probas_b)
+        else:
+            # case2: permutation, sample from A+B twice
+            u, v = (np.random.choice(list_1 + list_2, size=M_permutation),
+                    np.random.choice(list_1 + list_2, size=M_permutation))
+    else:
+        # TODO: Assert good behavior
+        u, v = list_1, list_2
+    assert len(u) == len(v), 'Inconsistent number of indices used for pairs'
+    return u, v
+
+
 def get_bayes_factors(
     px_scale: Union[List[float], np.ndarray],
     all_labels: Union[List, np.ndarray],
     cell_idx: Union[int, str],
     other_cell_idx: Optional[Union[int, str]] = None,
     genes_idx: Union[List[int], np.ndarray] = None,
+    log_ratios: Union[List[int], np.ndarray] = None,
+    importance_sampling : bool = False,
     M_permutation: int = 10000,
     permutation: bool = False,
     sample_pairs: bool = True,
@@ -848,42 +1166,160 @@ def get_bayes_factors(
         Simply formulated, pairs obtained from posterior sampling (when calling
         `sample_scale_from_batch`) will be randomly permuted so that the number of
         pairs used to compute Bayes Factors becomes M_permutation.
-        :param M_permutation: Number of times we will "mix" posterior samples in step 2.
-            Only makes sense when sample_pairs=True
+    :param log_ratios: un-normalized weights for importance sampling
+    :param importance_sampling: whether to use IS
+    :param M_permutation: Number of times we will "mix" posterior samples in step 2.
+        Only makes sense when sample_pairs=True
     :param permutation: Whether or not to permute. Normal behavior is False.
         Setting permutation=True basically shuffles cell_idx and other_cell_idx so that we
         estimate Bayes Factors of random populations of the union of cell_idx and other_cell_idx.
     :return:
     """
+
     idx = (all_labels == cell_idx)
-    idx_other = (all_labels == other_cell_idx) if other_cell_idx is not None else (all_labels != cell_idx)
+    idx_other = (all_labels == other_cell_idx) if other_cell_idx is not None else (
+            all_labels != cell_idx)
     if genes_idx is not None:
         px_scale = px_scale[:, genes_idx]
-    sample_rate_a = px_scale[idx].reshape(-1, px_scale.shape[1])
-    sample_rate_b = px_scale[idx_other].reshape(-1, px_scale.shape[1])
 
-    # agregate dataset
-    samples = np.vstack((sample_rate_a, sample_rate_b))
+    # first extract the data
+    # Assert that at this point we no longer have batch dimensions
+    assert len(px_scale.shape) == 2
+    sample_rate_a = px_scale[idx, :]
+    sample_rate_b = px_scale[idx_other, :]
+    # sample_rate_a = px_scale[:, idx, :]
+    # sample_rate_b = px_scale[:, idx_other, :]
+    sample_rate_a = sample_rate_a.reshape((-1, px_scale.shape[-1]))
+    sample_rate_b = sample_rate_b.reshape((-1, px_scale.shape[-1]))
+    samples = np.concatenate((sample_rate_a, sample_rate_b), axis=0)
+    # prepare the pairs for sampling
+    list_1 = list(np.arange(sample_rate_a.shape[0]))
+    list_2 = list(sample_rate_a.shape[0] + np.arange(sample_rate_b.shape[0]))
 
-    if sample_pairs is True:
-        # prepare the pairs for sampling
-        list_1 = list(np.arange(sample_rate_a.shape[0]))
-        list_2 = list(sample_rate_a.shape[0] + np.arange(sample_rate_b.shape[0]))
-        if not permutation:
-            # case1: no permutation, sample from A and then from B
-            u, v = np.random.choice(list_1, size=M_permutation), np.random.choice(list_2, size=M_permutation)
-        else:
-            # case2: permutation, sample from A+B twice
-            u, v = (np.random.choice(list_1 + list_2, size=M_permutation),
-                    np.random.choice(list_1 + list_2, size=M_permutation))
+    if importance_sampling:
+        print('Importance Sampling')
+        # weight_a = log_ratios[:, idx]
+        # weight_b = log_ratios[:, idx_other]
+        print(log_ratios.shape)
+        weight_a = log_ratios[idx]
+        weight_b = log_ratios[idx_other]
+
+        # second let's normalize the weights
+        weight_a = softmax(weight_a)
+        weight_b = softmax(weight_b)
+        # reshape and aggregate dataset
+        weight_a = weight_a.flatten()
+        weight_b = weight_b.flatten()
+        weights = np.concatenate((weight_a, weight_b))
+
+        # probas_a = weight_a / np.sum(idx)
+        # probas_b = weight_b / np.sum(idx_other)
+        probas_a = weight_a
+        probas_b = weight_b
+
+
+
+        print('IS A MAX', probas_a.max(), 'IS B MAX', probas_b.max())
+        u, v = get_sampling_pair_idx(list_1, list_2, do_sample=sample_pairs,
+                                     permutation=permutation, M_permutation=M_permutation,
+                                     probas_a=probas_a, probas_b=probas_b)
 
         # then constitutes the pairs
-        first_set = samples[u]
-        second_set = samples[v]
+        first_samples = samples[u]
+        second_samples = samples[v]
+        first_weights = weights[u]
+        second_weights = weights[v]
+
+        # print('u v shapes', u.shape, v.shape)
+
+        to_sum = first_weights[:, np.newaxis] * second_weights[:, np.newaxis] * (
+                first_samples >= second_samples)
+        incomplete_weights = first_weights * second_weights
+        res = np.sum(to_sum, axis=0) / np.sum(incomplete_weights, axis=0)
     else:
-        first_set = sample_rate_a
-        second_set = sample_rate_b
-    res = np.mean(first_set >= second_set, 0)
+        probas_a = None
+        probas_b = None
+
+        u, v = get_sampling_pair_idx(list_1, list_2, do_sample=sample_pairs,
+                                     permutation=permutation, M_permutation=M_permutation,
+                                     probas_a=probas_a, probas_b=probas_b)
+
+        # then constitutes the pairs
+        first_samples = samples[u]
+        second_samples = samples[v]
+        res = np.mean(first_samples >= second_samples, axis=0)
+    res = np.log(res + 1e-8) - np.log(1 - res + 1e-8)
+    return res
+
+
+def _p_wa_higher_wb(k1, k2, theta1, theta2):
+    """
+
+    :param k1: Shape of wa
+    :param k2: Shape of wb
+    :param theta1: Scale of wa
+    :param theta2: Scale of wb
+    :return:
+    """
+    a = k2
+    b = k1
+    x = theta1 / (theta1 + theta2)
+    return betainc(a, b, x)
+
+
+def get_bayes_gamma(data, all_labels, cell_idx, other_cell_idx=None, genes_idx=None,
+                    M_permutation=10000, permutation=False, sample_pairs=True):
+    """
+    Returns a list of bayes factor for all genes
+    :param px_scale: The gene frequency array for all cells (might contain multiple samples per cells)
+    :param all_labels: The labels array for the corresponding cell types
+    :param cell_idx: The first cell type population to consider. Either a string or an idx
+    :param other_cell_idx: (optional) The second cell type population to consider. Either a string or an idx
+    :param M_permutation: The number of permuted samples.
+    :param permutation: Whether or not to permute.
+    :return:
+    """
+    res = []
+    idx = (all_labels == cell_idx)
+    idx_other = (all_labels == other_cell_idx) if other_cell_idx is not None else (all_labels != cell_idx)
+
+    shapes, scales = data
+
+    if genes_idx is not None:
+        shapes = shapes[:, genes_idx]
+        scales = scales[:, genes_idx]
+
+    sample_shape_a = shapes[idx].squeeze()
+    sample_scales_a = scales[idx_other].squeeze()
+    sample_shape_b = shapes[idx].squeeze()
+    sample_scales_b = scales[idx_other].squeeze()
+
+    assert sample_shape_a.shape == sample_scales_a.shape
+    assert sample_shape_b.shape == sample_scales_b.shape
+
+    # agregate dataset
+    samples_shape = np.vstack((sample_shape_a, sample_shape_b))
+    samples_scales = np.vstack((sample_scales_a, sample_scales_b))
+
+    # prepare the pairs for sampling
+    list_1 = list(np.arange(sample_shape_a.shape[0]))
+    list_2 = list(sample_shape_a.shape[0] + np.arange(sample_shape_b.shape[0]))
+
+    u, v = get_sampling_pair_idx(list_1, list_2, permutation=permutation,
+                                 M_permutation=M_permutation,
+                                 probas_a=None, probas_b=None, do_sample=sample_pairs)
+
+    # then constitutes the pairs
+    first_set = (samples_shape[u], samples_scales[u])
+    second_set = (samples_shape[v], samples_scales[v])
+
+    shapes_a, scales_a = first_set
+    shapes_b, scales_b = second_set
+    for shape_a, scale_a, shape_b, scale_b in zip(shapes_a, scales_a, shapes_b, scales_b):
+        res.append(_p_wa_higher_wb(shape_a, shape_b, scale_a, scale_b))
+    res = np.array(res)
+    res = np.mean(res, axis=0)
+    assert len(res) == shapes_a.shape[1]
     res = np.log(res + 1e-8) - np.log(1 - res + 1e-8)
     return res
 

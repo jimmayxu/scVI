@@ -41,7 +41,7 @@ class Trainer:
 
     def __init__(self, model, gene_dataset, use_cuda=True, metrics_to_monitor=None, benchmark=False,
                  frequency=None, weight_decay=1e-6, early_stopping_kwargs=None,
-                 data_loader_kwargs=None, show_progbar=True):
+                 data_loader_kwargs=None, show_progbar=True, batch_size=128):
         # handle mutable defaults
         early_stopping_kwargs = early_stopping_kwargs if early_stopping_kwargs else dict()
         data_loader_kwargs = data_loader_kwargs if data_loader_kwargs else dict()
@@ -51,7 +51,7 @@ class Trainer:
         self._posteriors = OrderedDict()
 
         self.data_loader_kwargs = {
-            "batch_size": 128,
+            "batch_size": batch_size,
             "pin_memory": use_cuda
         }
         self.data_loader_kwargs.update(data_loader_kwargs)
@@ -84,6 +84,9 @@ class Trainer:
 
         self.show_progbar = show_progbar
 
+        self.train_losses = []
+        self.debug_loss = 0
+
     @torch.no_grad()
     def compute_metrics(self):
         begin = time.time()
@@ -95,6 +98,9 @@ class Trainer:
 
                 for name, posterior in self._posteriors.items():
                     message = ' '.join([s.capitalize() for s in name.split('_')[-2:]])
+                    if posterior.nb_cells < 5:
+                        logging.debug(message + " is too small to track metrics (<5 samples)")
+                        continue
                     if hasattr(posterior, 'to_monitor'):
                         for metric in posterior.to_monitor:
                             if metric not in self.metrics_to_monitor:
@@ -136,11 +142,18 @@ class Trainer:
             for self.epoch in pbar:
                 self.on_epoch_begin()
                 pbar.update(1)
+
+                loss_mean = []
                 for tensors_list in self.data_loaders_loop():
                     loss = self.loss(*tensors_list)
                     optimizer.zero_grad()
+                    loss_mean.append(loss.item())
+                    self.debug_loss = loss
                     loss.backward()
                     optimizer.step()
+
+                loss_mean = np.mean(loss_mean)
+                self.train_losses.append(loss_mean)
 
                 if not self.on_epoch_end():
                     break
@@ -222,19 +235,41 @@ class Trainer:
         else:
             object.__setattr__(self, name, value)
 
-    def train_test(self, model=None, gene_dataset=None, train_size=0.1, test_size=None, seed=0, type_class=Posterior):
+    def train_test(
+        self,
+        model=None,
+        gene_dataset=None,
+        train_size=0.1,
+        test_size=None,
+        seed=0,
+        test_indices=None,
+        type_class=Posterior
+    ):
         """
         :param train_size: float, int, or None (default is 0.1)
         :param test_size: float, int, or None (default is None)
+        :param model:
+        :param gene_dataset:
+        :param seed:
+        :param test_indices:
+        :param type_class:
         """
         model = self.model if model is None and hasattr(self, "model") else model
         gene_dataset = self.gene_dataset if gene_dataset is None and hasattr(self, "model") else gene_dataset
+
         n = len(gene_dataset)
-        n_train, n_test = _validate_shuffle_split(n, test_size, train_size)
-        np.random.seed(seed=seed)
-        permutation = np.random.permutation(n)
-        indices_test = permutation[:n_test]
-        indices_train = permutation[n_test:(n_test + n_train)]
+        if test_indices is None:
+            n_train, n_test = _validate_shuffle_split(n, test_size, train_size)
+            np.random.seed(seed=seed)
+            permutation = np.random.permutation(n)
+            indices_test = permutation[:n_test]
+            indices_train = permutation[n_test:(n_test + n_train)]
+        else:
+            indices_test = np.array(test_indices)
+            all_indices = np.arange(len(gene_dataset))
+            indices_train = ~np.isin(all_indices, indices_test)
+            indices_train = all_indices[indices_train]
+            assert len(np.intersect1d(indices_train, indices_test)) == 0
 
         return (
             self.create_posterior(model, gene_dataset, indices=indices_train, type_class=type_class),
