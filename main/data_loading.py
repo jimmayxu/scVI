@@ -31,3 +31,15 @@ np.savetxt("../data/pbmc_label.csv", labels, delimiter=",")
 
 
 
+
+## extracting raw data
+adata.raw.obs = adata.obs
+
+rawadata = adata.raw
+
+
+import scanpy as sc
+
+sc.write_h5ad()
+
+

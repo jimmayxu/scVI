@@ -1,4 +1,4 @@
-from scvi.dataset.anndataset import AnnDatasetFromAnnData, DownloadableAnnDataset
+from scvi.dataset.anndataset import AnnDatasetFromAnnData, DownloadableAnnDataset, DownloadableRawAnnDataset
 from scvi.dataset.brain_large import BrainLargeDataset
 from scvi.dataset.cite_seq import CiteSeqDataset, CbmcDataset
 from scvi.dataset.cortex import CortexDataset
@@ -43,4 +43,5 @@ __all__ = [
     "SyntheticRandomDataset",
     "SyntheticDatasetCorr",
     "ZISyntheticDatasetCorr",
+    "DownloadableRawAnnDataset",
 ]
