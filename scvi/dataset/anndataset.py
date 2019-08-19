@@ -127,7 +127,9 @@ class DownloadableRawAnnDataset(DownloadableDataset):
         save_path: str = "data/",
         url: str = None,
         delayed_populating: bool = False,
+        new_n_genes: int = 10000,
     ):
+        self.new_n_genes = new_n_genes
         super().__init__(
             urls=url,
             filenames=filename,
@@ -162,7 +164,7 @@ class DownloadableRawAnnDataset(DownloadableDataset):
             cell_types=cell_types,
         )
         self.filter_cells_by_count()
-        self.subsample_genes(new_n_genes=1000)
+        self.subsample_genes(new_n_genes=self.new_n_genes)
 
 
 
