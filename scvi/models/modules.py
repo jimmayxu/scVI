@@ -280,6 +280,7 @@ class LinearDecoderSCVI(nn.Module):
         self, dispersion: str, z: torch.Tensor, library: torch.Tensor, *cat_list: int
     ):
         # The decoder returns values for the parameters of the ZINB distribution
+        # z = softmax(z)
         p1_ = self.factor_regressor(z)
         if self.n_batches > 1:
             one_hot_cat = one_hot(cat_list[0], self.n_batches)[:, :-1]
