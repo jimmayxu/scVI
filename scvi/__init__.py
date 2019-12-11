@@ -4,7 +4,7 @@
 
 __author__ = "Romain Lopez"
 __email__ = "romain_lopez@berkeley.edu"
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 # Set default logging handler to avoid logging with logging.lastResort logger.
 import logging
@@ -17,5 +17,7 @@ logger.addHandler(NullHandler())
 
 # default to INFO level logging for the scvi package
 set_verbosity(logging.INFO)
+# this prevents double outputs
+logger.propagate = False
 
 __all__ = ["set_verbosity"]

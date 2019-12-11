@@ -1,15 +1,17 @@
 import numpy as np
 
-from scvi.dataset import CortexDataset, SyntheticDataset
+from scvi.dataset import CortexDataset, SyntheticDataset, GeneExpressionDataset
 from scvi.inference import (
     JointSemiSupervisedTrainer,
     AlternateSemiSupervisedTrainer,
     ClassifierTrainer,
     UnsupervisedTrainer,
     AdapterTrainer,
+    TotalTrainer,
 )
+from scvi.inference.posterior import unsupervised_clustering_accuracy
 from scvi.inference.annotation import compute_accuracy_rf, compute_accuracy_svc
-from scvi.models import VAE, SCANVI, VAEC, LDVAE
+from scvi.models import VAE, SCANVI, VAEC, LDVAE, TOTALVI, AutoZIVAE
 from scvi.models.classifier import Classifier
 
 use_cuda = True
@@ -24,6 +26,8 @@ def test_cortex(save_path):
     trainer_cortex_vae.train(n_epochs=1)
     trainer_cortex_vae.train_set.reconstruction_error()
     trainer_cortex_vae.train_set.differential_expression_stats()
+    trainer_cortex_vae.train_set.imputation(n_samples=1)
+    trainer_cortex_vae.test_set.imputation(n_samples=5)
 
     trainer_cortex_vae.corrupt_posteriors(corruption="binomial")
     trainer_cortex_vae.corrupt_posteriors()
@@ -110,7 +114,6 @@ def test_synthetic_1():
     trainer_synthetic_svaec.unlabelled_set.differential_expression_score(
         synthetic_dataset.labels.ravel() == 1,
         synthetic_dataset.labels.ravel() == 2,
-        genes=["2", "4"],
         n_samples=2,
         M_permutation=10,
     )
@@ -159,6 +162,25 @@ def ldvae_benchmark(dataset, n_epochs, use_cuda=True):
     return trainer
 
 
+def totalvi_benchmark(dataset, n_epochs, use_cuda=True):
+    totalvae = TOTALVI(
+        dataset.nb_genes, len(dataset.protein_names), n_batch=dataset.n_batches
+    )
+    trainer = TotalTrainer(totalvae, dataset, train_size=0.5, use_cuda=use_cuda)
+    trainer.train(n_epochs=n_epochs)
+    trainer.test_set.reconstruction_error()
+    trainer.test_set.marginal_ll()
+
+    trainer.test_set.get_protein_background_mean()
+    trainer.test_set.get_latent()
+    trainer.test_set.generate()
+    trainer.test_set.get_sample_dropout()
+    trainer.test_set.get_normalized_denoised_expression()
+    trainer.test_set.imputation()
+
+    return trainer
+
+
 def test_synthetic_3():
     gene_dataset = SyntheticDataset()
     trainer = base_benchmark(gene_dataset)
@@ -176,6 +198,21 @@ def test_nb_not_zinb():
         synthetic_dataset.n_labels,
         labels_groups=[0, 0, 1],
         reconstruction_loss="nb",
+    )
+    trainer_synthetic_svaec = JointSemiSupervisedTrainer(
+        svaec, synthetic_dataset, use_cuda=use_cuda
+    )
+    trainer_synthetic_svaec.train(n_epochs=1)
+
+
+def test_poisson_not_zinb():
+    synthetic_dataset = SyntheticDataset()
+    svaec = SCANVI(
+        synthetic_dataset.nb_genes,
+        synthetic_dataset.n_batches,
+        synthetic_dataset.n_labels,
+        labels_groups=[0, 0, 1],
+        reconstruction_loss="poisson",
     )
     trainer_synthetic_svaec = JointSemiSupervisedTrainer(
         svaec, synthetic_dataset, use_cuda=use_cuda
@@ -221,3 +258,111 @@ def test_sampling_zl(save_path):
     )
     trainer_cortex_cls.train(n_epochs=2)
     trainer_cortex_cls.test_set.accuracy()
+
+
+def test_differential_expression(save_path):
+    dataset = CortexDataset(save_path=save_path)
+    n_cells = len(dataset)
+    all_indices = np.arange(n_cells)
+    vae = VAE(dataset.nb_genes, dataset.n_batches)
+    trainer = UnsupervisedTrainer(vae, dataset, train_size=0.5, use_cuda=use_cuda)
+    trainer.train(n_epochs=2)
+    post = trainer.create_posterior(vae, dataset, shuffle=False, indices=all_indices)
+
+    # Sample scale example
+    px_scales = post.scale_sampler(
+        n_samples_per_cell=4, n_samples=None, selection=all_indices
+    )["scale"]
+    assert (
+        px_scales.shape[1] == dataset.nb_genes
+    ), "posterior scales should have shape (n_samples, n_genes)"
+
+    # Differential expression different models
+    idx_1 = [1, 2, 3]
+    idx_2 = [4, 5, 6, 7]
+    de_dataframe = post.differential_expression_score(
+        idx1=idx_1,
+        idx2=idx_2,
+        n_samples=10,
+        mode="vanilla",
+        use_permutation=True,
+        M_permutation=100,
+    )
+
+    de_dataframe = post.differential_expression_score(
+        idx1=idx_1,
+        idx2=idx_2,
+        n_samples=10,
+        mode="change",
+        use_permutation=True,
+        M_permutation=100,
+    )
+    print(de_dataframe.keys())
+    assert (
+        de_dataframe["confidence_interval_0.5_min"]
+        <= de_dataframe["confidence_interval_0.5_max"]
+    ).all()
+    assert (
+        de_dataframe["confidence_interval_0.95_min"]
+        <= de_dataframe["confidence_interval_0.95_max"]
+    ).all()
+
+    # DE estimation example
+    de_probabilities = de_dataframe.loc[:, "proba_de"]
+    assert ((0.0 <= de_probabilities) & (de_probabilities <= 1.0)).all()
+
+
+def test_totalvi(save_path):
+    synthetic_dataset_one_batch = SyntheticDataset(n_batches=1)
+    totalvi_benchmark(synthetic_dataset_one_batch, n_epochs=1, use_cuda=use_cuda)
+    synthetic_dataset_two_batches = SyntheticDataset(n_batches=2)
+    totalvi_benchmark(synthetic_dataset_two_batches, n_epochs=1, use_cuda=use_cuda)
+
+
+def test_autozi(save_path):
+    data = SyntheticDataset(n_batches=1)
+
+    for disp_zi in ["gene", "gene-label"]:
+        autozivae = AutoZIVAE(
+            n_input=data.nb_genes,
+            dispersion=disp_zi,
+            zero_inflation=disp_zi,
+            n_labels=data.n_labels,
+        )
+        trainer_autozivae = UnsupervisedTrainer(
+            model=autozivae, gene_dataset=data, train_size=0.5
+        )
+        trainer_autozivae.train(n_epochs=2, lr=1e-2)
+        trainer_autozivae.test_set.elbo()
+        trainer_autozivae.test_set.reconstruction_error()
+        trainer_autozivae.test_set.marginal_ll()
+
+
+def test_multibatches_features():
+    data = [
+        np.random.randint(1, 5, size=(20, 10)),
+        np.random.randint(1, 10, size=(20, 10)),
+        np.random.randint(1, 10, size=(20, 10)),
+        np.random.randint(1, 10, size=(30, 10)),
+    ]
+    dataset = GeneExpressionDataset()
+    dataset.populate_from_per_batch_list(data)
+    vae = VAE(dataset.nb_genes, dataset.n_batches)
+    trainer = UnsupervisedTrainer(vae, dataset, train_size=0.5, use_cuda=use_cuda)
+    trainer.train(n_epochs=2)
+    trainer.test_set.imputation(n_samples=2, transform_batch=0)
+    trainer.train_set.imputation(n_samples=2, transform_batch=[0, 1, 2])
+
+
+def test_deprecated_munkres():
+    y = np.array([0, 1, 0, 1, 0, 1, 1, 1])
+    y_pred = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    reward, assignment = unsupervised_clustering_accuracy(y, y_pred)
+    assert reward == 0.625
+    assert (assignment == np.array([[0, 0], [1, 1]])).all()
+
+    y = np.array([1, 1, 2, 2, 0, 0, 3, 3])
+    y_pred = np.array([1, 1, 2, 2, 3, 3, 0, 0])
+    reward, assignment = unsupervised_clustering_accuracy(y, y_pred)
+    assert reward == 1.0
+    assert (assignment == np.array([[0, 3], [1, 1], [2, 2], [3, 0]])).all()

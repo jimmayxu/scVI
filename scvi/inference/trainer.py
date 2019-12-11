@@ -1,6 +1,6 @@
 import logging
-import sys
 import time
+import sys
 
 from abc import abstractmethod
 from collections import defaultdict, OrderedDict
@@ -11,7 +11,7 @@ import torch
 
 from sklearn.model_selection._split import _validate_shuffle_split
 from torch.utils.data.sampler import SubsetRandomSampler
-from tqdm import trange
+from tqdm.auto import tqdm
 
 from scvi.inference.posterior import Posterior
 
@@ -72,6 +72,8 @@ class Trainer:
         self.benchmark = benchmark
         self.epoch = -1  # epoch = self.epoch + 1 in compute metrics
         self.training_time = 0
+        self.previous_loss_was_nan = False
+        self.nan_counter = 0  # Counts occuring NaNs during training
 
         if metrics_to_monitor is not None:
             self.metrics_to_monitor = set(metrics_to_monitor)
@@ -126,7 +128,7 @@ class Trainer:
                 self.model.train()
         self.compute_metrics_time += time.time() - begin
 
-    def train(self, n_epochs=20, lr=1e-3, eps=0.01, params=None):
+    def train(self, n_epochs=20, lr=1e-3, eps=0.01, max_nans=10, params=None):
         begin = time.time()
         self.model.train()
 
@@ -141,24 +143,24 @@ class Trainer:
         self.n_epochs = n_epochs
         self.compute_metrics()
 
-        with trange(
-            n_epochs, desc="training", file=sys.stdout, disable=not self.show_progbar
-        ) as pbar:
-            # We have to use tqdm this way so it works in Jupyter notebook.
-            # See https://stackoverflow.com/questions/42212810/tqdm-in-jupyter-notebook
-            for self.epoch in pbar:
-                self.on_epoch_begin()
-                pbar.update(1)
-                for tensors_list in self.data_loaders_loop():
-                    if tensors_list[0][0].shape[0] < 3:
-                        continue
-                    loss = self.loss(*tensors_list)
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+        for self.epoch in tqdm(
+            range(n_epochs),
+            desc="training",
+            disable=not self.show_progbar,
+            file=sys.stdout,
+        ):
+            self.on_epoch_begin()
+            for tensors_list in self.data_loaders_loop():
+                if tensors_list[0][0].shape[0] < 3:
+                    continue
+                loss = self.loss(*tensors_list)
+                self.check_training_status(loss, max_nans)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-                if not self.on_epoch_end():
-                    break
+            if not self.on_epoch_end():
+                break
 
         if self.early_stopping.save_best_state_metric is not None:
             self.model.load_state_dict(self.best_state_dict)
@@ -170,6 +172,29 @@ class Trainer:
             logger.debug(
                 "\nTraining time:  %i s. / %i epochs"
                 % (int(self.training_time), self.n_epochs)
+            )
+
+    def check_training_status(self, loss: torch.Tensor, max_nans: int):
+        """
+        Checks if loss is admissible. If not, training is stopped after max_nans consecutive
+        inadmissible loss
+        :param loss: Training loss of the model
+        :param max_nans: Maximum number of consecutive NaNs after which a ValueError will be
+        raised
+        """
+        loss_is_nan = torch.isnan(loss).item()
+        if loss_is_nan:
+            logger.warning("Model training loss was NaN")
+            self.nan_counter += 1
+            self.previous_loss_was_nan = True
+        else:
+            self.nan_counter = 0
+            self.previous_loss_was_nan = False
+
+        if self.nan_counter >= max_nans:
+            raise ValueError(
+                "Loss was NaN {} consecutive times: the model is not training properly. "
+                "Consider using a lower learning rate.".format(max_nans)
             )
 
     def on_epoch_begin(self):
@@ -193,7 +218,7 @@ class Trainer:
                 self.history[early_stopping_metric + "_" + on][-1]
             )
             if reduce_lr:
-                logger.info("Reducing LR.")
+                logger.info("Reducing LR on epoch {}.".format(self.epoch))
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] *= self.early_stopping.lr_factor
 
@@ -204,9 +229,8 @@ class Trainer:
     def posteriors_loop(self):
         pass
 
-    def data_loaders_loop(
-        self
-    ):  # returns an zipped iterable corresponding to loss signature
+    def data_loaders_loop(self):
+        """returns an zipped iterable corresponding to loss signature"""
         data_loaders_loop = [self._posteriors[name] for name in self.posteriors_loop]
         return zip(
             data_loaders_loop[0],
@@ -270,7 +294,16 @@ class Trainer:
             else gene_dataset
         )
         n = len(gene_dataset)
-        n_train, n_test = _validate_shuffle_split(n, test_size, train_size)
+        try:
+            n_train, n_test = _validate_shuffle_split(n, test_size, train_size)
+        except ValueError:
+            if train_size != 1.0:
+                raise ValueError(
+                    "Choice of train_size={} and test_size={} not understood".format(
+                        train_size, test_size
+                    )
+                )
+            n_train, n_test = n, 0
         random_state = np.random.RandomState(seed=self.seed)
         permutation = random_state.permutation(n)
         indices_test = permutation[:n_test]
@@ -333,6 +366,7 @@ class EarlyStopping:
         reduce_lr_on_plateau: bool = False,
         lr_patience: int = 10,
         lr_factor: float = 0.5,
+        posterior_class=Posterior,
     ):
         self.benchmark = benchmark
         self.patience = patience
@@ -341,7 +375,7 @@ class EarlyStopping:
         self.wait = 0
         self.wait_lr = 0
         self.mode = (
-            getattr(Posterior, early_stopping_metric).mode
+            getattr(posterior_class, early_stopping_metric).mode
             if early_stopping_metric is not None
             else None
         )

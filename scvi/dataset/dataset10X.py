@@ -50,6 +50,7 @@ available_datasets = {
         "heart_1k_v3",
         "heart_10k_v3",
     ],
+    "3.1.0": ["5k_pbmc_protein_v3", "5k_pbmc_protein_v3_nextgem"],
 }
 
 dataset_to_group = dict(
@@ -64,12 +65,14 @@ group_to_url_skeleton = {
     "1.1.0": "http://cf.10xgenomics.com/samples/cell-exp/{}/{}/{}_{}_gene_bc_matrices.tar.gz",
     "2.1.0": "http://cf.10xgenomics.com/samples/cell-exp/{}/{}/{}_{}_gene_bc_matrices.tar.gz",
     "3.0.0": "http://cf.10xgenomics.com/samples/cell-exp/{}/{}/{}_{}_feature_bc_matrix.tar.gz",
+    "3.1.0": "http://cf.10xgenomics.com/samples/cell-exp/{}/{}/{}_{}_feature_bc_matrix.tar.gz",
 }
 
 group_to_filename_skeleton = {
     "1.1.0": "{}_gene_bc_matrices.tar.gz",
     "2.1.0": "{}_gene_bc_matrices.tar.gz",
     "3.0.0": "{}_feature_bc_matrix.tar.gz",
+    "3.1.0": "{}_feature_bc_matrix.tar.gz",
 }
 
 available_specification = ["filtered", "raw"]
@@ -200,8 +203,9 @@ class Dataset10X(DownloadableDataset):
                     if measurement_type == "Antibody Capture":
                         measurement_type = "protein_expression"
                         columns_attr_name = "protein_names"
-                        # protein counts are inherently not sparse
-                        measurement_data = measurement_data.A
+                        # protein counts do not have many zeros so always make dense
+                        if self.dense is not True:
+                            measurement_data = measurement_data.A
                     else:
                         measurement_type = measurement_type.lower().replace(" ", "_")
                         columns_attr_name = measurement_type + "_names"
@@ -256,6 +260,8 @@ class Dataset10X(DownloadableDataset):
         :return: path in which files are contains and their suffix if compressed.
         """
         for root, subdirs, files in os.walk(self.save_path):
+            # do not consider hidden files
+            files = [f for f in files if not f[0] == "."]
             contains_mat = [
                 filename == "matrix.mtx" or filename == "matrix.mtx.gz"
                 for filename in files
