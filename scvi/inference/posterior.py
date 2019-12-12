@@ -1124,16 +1124,10 @@ class Posterior:
         """
         posterior_list = []
         for tensors in self.update({"batch_size": batch_size}):
-            x, _, _, batch_index, labels, y = tensors
-            with torch.no_grad():
-                outputs = self.model.inference(
-                    x,
-                    y,
-                    batch_index=batch_index,
-                    label=labels,
-                    n_samples=n_samples,
-                    transform_batch=transform_batch,
-                )
+            sample_batch, _, _, batch_index, labels = tensors
+            outputs = self.model.inference(
+                sample_batch, batch_index=batch_index, y=labels, n_samples=n_samples
+            )
             px_scale = outputs["px_scale"]
             px_r = outputs["px_r"]
 
@@ -1141,7 +1135,7 @@ class Posterior:
             if len(px_r.size()) == 2:
                 px_dispersion = px_r
             else:
-                px_dispersion = torch.ones_like(x) * px_r
+                px_dispersion = torch.ones_like(sample_batch) * px_r
 
             # This gamma is really l*w using scVI manuscript notation
             p = rate / (rate + px_dispersion)
@@ -1166,7 +1160,7 @@ class Posterior:
         rna_size_factor: int = 1000,
         transform_batch: Optional[Union[int, List[int]]] = None,
     ):
-        """ Wrapper of `generate_denoised_samples()` to create a gene-protein gene-protein corr matrix
+        """ Wrapper of `generate_denoised_samples()` to create a gene-gene corr matrix
         :param n_samples: How may samples per cell
         :param batch_size: Mini-batch size for sampling. Lower means less GPU memory footprint
         :rna_size_factor: size factor for RNA prior to sampling gamma distribution
