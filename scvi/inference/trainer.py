@@ -145,7 +145,7 @@ class Trainer:
 
         for self.epoch in tqdm(
             range(n_epochs),
-            desc="training",
+            desc="training scVI model",
             disable=not self.show_progbar,
             file=sys.stdout,
         ):
